@@ -1,4 +1,4 @@
-# sable-curlew-3d
+# PolyForge
 
 For each prompt image this miner asks the witness for a handful of Three.js drafts, renders them, keeps the ones that
 match the picture best and keeps revising them; the final pick is the version that looks most like the photo.
