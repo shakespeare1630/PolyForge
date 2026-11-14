@@ -48,18 +48,22 @@ async def _vertex_generate(image: bytes, seed: int, witness: Any) -> str | None:
 
 async def generate(image: bytes, seed: int, witness: Any) -> str | None:
     """The pipeline's module with reflection bands on plain polished silver (vertex colours only); the plain module ships
-    if the guided one is rejected by the renderer."""
-    from miner404.pipeline import FRONT_JUDGE
+    if the guided one cannot be rendered."""
+    from miner404.pipeline import FRONT_JUDGE, PatientRenderer
     from miner404.silver_guide import silver_guide
-    from witness_client import RenderRejected
+    from witness_client import RenderRejected, RenderUnavailable
 
     source = await _vertex_generate(image, seed, witness)
     candidate = silver_guide(source)
     if candidate == source:
         return source
+    # The check goes through the pipeline's own render path: a gateway timeout (HTTP 500/502/504) counts as RENDER_TIMEOUT, a
+    # multi-view deadline miss falls back to single views and a full queue is waited out. Whatever still fails, the plain
+    # module (already rendered by the pipeline) ships; witness errors propagate as everywhere else.
+    renderer = PatientRenderer(_Bridge(witness, asyncio.get_running_loop()))
     try:
-        await witness.render(candidate, FRONT_JUDGE)
-    except RenderRejected:
+        await asyncio.to_thread(renderer.render, candidate, FRONT_JUDGE)
+    except (RenderRejected, RenderUnavailable):
         return source
     return candidate
 
