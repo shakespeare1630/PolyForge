@@ -78,6 +78,8 @@ CRITIQUE_ID = 9400  # the critique of the drafts; + 10 the module merged from th
 CALL_RESERVE = 3  # calls the round planner leaves for the pose choice and one repair
 JUDGE_MAX_OUTPUT = 4096
 JUDGE_DRAW = 0.7  # the judge's own first-stage draw threshold, in mean penalty points
+GATE_MATCH_W = 1.0  # 404-udpate1: weight of the photo-match difference in the gate (penalty points per match unit)
+GATE_T = 0.0  # 404-udpate1: the child stays if gap + W * match difference >= -GATE_T
 TILT_SELECT_ID = 9960  # the judged final tilt; the mirrored call takes the next id
 TILT_CHOICES = (0, 20, 40)  # degrees toward the cameras, offered for the finished module
 TILT_MARGIN = 0.25  # mean penalty points a new tilt must gain over the module as finished
@@ -562,6 +564,7 @@ class Candidate:
     views: list[bytes] = field(default_factory=list)  # close-ups of the four front views
     parent: Candidate | None = None
     match: float = 0.0  # how closely the views match the photo, in measured plans
+    gate_match: float | None = None  # 404-udpate1: photo-match of the four judge views, for the gate
     measurements: str = ""
     overlay: bytes = b""
     fixes: list[str] = field(default_factory=list)  # the selector's fixes from the last selection that scored it
@@ -703,6 +706,7 @@ class Pipeline:
         self.instructions = prompts.GENERATE_CHAIN
         self.astra_cap = ASTRA_MAX_OUTPUT
         self.photo: match.Appearance | None = None
+        self._gate_photo: match.Appearance | None = None  # 404-udpate1: the photo's appearance, for the gate only
         self.brief = ""
         self.patch_log: list[dict[str, Any]] = []  # one entry per patch-edit reply
         self.patch_ratios: list[float] = []  # per patch-edit reply: its visible tokens over the module's (1 for a whole module)
@@ -904,7 +908,28 @@ class Pipeline:
             except (ValueError, TypeError, KeyError, AttributeError):
                 continue
             gaps.append(one - two if parent_first else two - one)
-        return bool(gaps) and sum(gaps) / len(gaps) >= -JUDGE_DRAW
+        if not gaps:
+            return False
+        gap = sum(gaps) / len(gaps)
+        if self._gate_photo is None or len(parent.shots) < 4 or len(child.shots) < 4:
+            return gap >= -JUDGE_DRAW  # no photo-match available: the production rule
+        lift = self._gate_match(child) - self._gate_match(parent)  # 404-udpate1: the free photo-match score, no calls
+        return gap + GATE_MATCH_W * lift >= -GATE_T
+
+    def _gate_match(self, candidate: Candidate) -> float:
+        """404-udpate1: grid_score of the candidate's four uncropped judge views against the photo (0 when unavailable)."""
+        if self._gate_photo is None or len(candidate.shots) < 4:
+            return 0.0
+        if candidate.gate_match is None:
+            tiles = [Image.open(io.BytesIO(b)).convert("RGB") for b in candidate.shots[:4]]
+            w, h = tiles[0].size
+            sheet = Image.new("RGB", (2 * w, 2 * h), "white")
+            for k, t in enumerate(tiles):
+                sheet.paste(t, ((k % 2) * w, (k // 2) * h))
+            buffer = io.BytesIO()
+            sheet.save(buffer, "PNG")
+            candidate.gate_match = match.grid_score(buffer.getvalue(), self._gate_photo)
+        return candidate.gate_match
 
     def feedback(self, step: Step, parent: Candidate) -> str:
         """Extra text for a rewrite: the selector's fixes for the parent and the earlier rounds, when the step asks for them."""
@@ -1082,7 +1107,7 @@ class Pipeline:
             return source, rejection.detail_json
         candidate = Candidate(name, source, view_sheet(views), grid, raw, views)
         if self.keep_shots:
-            candidate.shots = judge_shots(front)[:2]
+            candidate.shots = judge_shots(front)  # 404-udpate1: all four views (judge_pick asks on 0 and 1)
         if self.photo is not None:
             candidate.match = match.grid_score(front, self.photo)
             candidate.measurements, candidate.overlay = match.feedback(front, self.photo)
@@ -1317,8 +1342,12 @@ class Pipeline:
     def run_stages(self, plan: StagePlan) -> str:
         self.wrapper = chain_wrapper(plan.fill, plan.glow, plan.outline_fit or plan.measured)
         self.level_tilt = plan.level_tilt
-        self.keep_shots = any(step.judge_pick for step in plan.steps)
+        self.keep_shots = True  # 404-udpate1: the gate's photo-match uses all four judge views
         self.end_reserve = 2 * worst_case(SOL, 4000, 11, SELECT_MAX_OUTPUT) if plan.judged_tilt else 0.0
+        try:
+            self._gate_photo = match.photo_appearance(self.image)  # 404-udpate1: for the gate only (no calls)
+        except Exception:  # noqa: BLE001 - an unreadable photo just leaves the gate as it was
+            self._gate_photo = None
         closeup = object_closeup(self.image)
         if closeup is not None:
             self.closeup = [{"type": "input_image", "image_url": data_url(closeup), "detail": "high"}]
